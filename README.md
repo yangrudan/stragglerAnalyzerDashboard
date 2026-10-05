@@ -2,6 +2,8 @@
 
 将 Straggler Observer 的 `analyzer.log` 转成可离线打开的单文件 HTML 报告，同时在终端输出简短中文结论。
 
+[离线版本]
+
 ## 快速使用
 
 ```bash
