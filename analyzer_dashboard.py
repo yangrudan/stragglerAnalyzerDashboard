@@ -14,7 +14,7 @@ import webbrowser
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 RETRY_RE = re.compile(
@@ -66,9 +66,8 @@ def parse_key_values(line: str) -> dict[str, Any]:
     return values
 
 
-def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
-    records: list[dict[str, Any]] = []
-    malformed = 0
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any] | None]:
+    """Yield valid objects or None for malformed nonempty lines."""
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             text = line.strip()
@@ -77,13 +76,31 @@ def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
             try:
                 value = json.loads(text)
             except json.JSONDecodeError:
-                malformed += 1
+                yield None
                 continue
-            if isinstance(value, dict):
-                records.append(value)
-            else:
-                malformed += 1
+            yield value if isinstance(value, dict) else None
+
+
+def parse_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
+    records: list[dict[str, Any]] = []
+    malformed = 0
+    for value in iter_jsonl(path):
+        if value is None:
+            malformed += 1
+        else:
+            records.append(value)
     return records, malformed
+
+
+def count_jsonl(path: Path) -> tuple[int, int]:
+    """Count suppressed events without retaining their payloads."""
+    count = malformed = 0
+    for value in iter_jsonl(path):
+        if value is None:
+            malformed += 1
+        else:
+            count += 1
+    return count, malformed
 
 
 def parse_log(path: Path) -> dict[str, Any]:
@@ -296,7 +313,7 @@ def aggregate_ranks(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def build_model(
-    parsed: dict[str, Any], suppressed_records: list[dict[str, Any]] | None = None
+    parsed: dict[str, Any], suppressed_records: list[dict[str, Any]] | int | None = None
 ) -> dict[str, Any]:
     iterations = parsed["iterations"]
     alerts = parsed["slowdown_alerts"]
@@ -315,11 +332,15 @@ def build_model(
         if expected_ms is not None and threshold_ratio is not None
         else None
     )
-    actual_values = [
+    actual_values = (
         float(item["actual_iteration_ms"])
         for item in iterations
         if item.get("actual_iteration_ms") is not None
-    ]
+    )
+    min_actual = max_actual = None
+    for value in actual_values:
+        min_actual = value if min_actual is None else min(min_actual, value)
+        max_actual = value if max_actual is None else max(max_actual, value)
     normal_count = sum(not bool(item.get("slow")) for item in iterations)
     slow_count = sum(bool(item.get("slow")) for item in iterations)
 
@@ -338,7 +359,10 @@ def build_model(
         )
     regions.sort(key=lambda row: (row["alerts"], row["records"]), reverse=True)
 
-    suppressed = suppressed_records or []
+    suppressed = suppressed_records if isinstance(suppressed_records, list) else []
+    suppressed_count = (
+        suppressed_records if isinstance(suppressed_records, int) else len(suppressed)
+    )
     model = {
         **parsed,
         "other_events": parsed.get("other_events") or {},
@@ -347,15 +371,15 @@ def build_model(
         "threshold_ms": threshold_ms,
         "normal_count": normal_count,
         "slow_count": slow_count,
-        "min_actual_ms": min(actual_values) if actual_values else None,
-        "max_actual_ms": max(actual_values) if actual_values else None,
+        "min_actual_ms": min_actual,
+        "max_actual_ms": max_actual,
         "episodes": episodes,
         "rank_summary": ranks,
         "regions": regions,
         "iteration_stats": iteration_stats,
         "dingtalk_stats": dingtalk_stats,
         "suppressed_records": suppressed,
-        "suppressed_count": len(suppressed),
+        "suppressed_count": suppressed_count,
     }
     model["insights"] = build_insights(model)
     model["generated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -591,7 +615,40 @@ def render_delivery(model: dict[str, Any]) -> str:
     )
 
 
-def render_html(model: dict[str, Any], title: str) -> str:
+def sample_iterations(
+    iterations: list[dict[str, Any]], alerts: list[dict[str, Any]], budget: int
+) -> list[dict[str, Any]]:
+    """Keep bucket extrema, endpoints, and every slow/alert iteration.
+
+    The budget limits ordinary trend points; mandatory points may exceed it.
+    Zero disables sampling.
+    """
+    if budget != 0 and budget < 4:
+        raise ValueError("chart_points must be zero or at least 4")
+    if budget == 0 or len(iterations) <= budget:
+        return iterations
+    alert_ids = {item.get("iteration_id") for item in alerts}
+    selected = {0, len(iterations) - 1}
+    for index, item in enumerate(iterations):
+        if item.get("slow") or item.get("iteration_id") in alert_ids:
+            selected.add(index)
+    buckets = max(1, (budget - 2) // 2)
+    def actual(index: int) -> float:
+        return float(iterations[index].get("actual_iteration_ms") or 0)
+
+    for bucket in range(buckets):
+        start = bucket * len(iterations) // buckets
+        end = (bucket + 1) * len(iterations) // buckets
+        indices = range(start, end)
+        selected.add(min(indices, key=actual))
+        selected.add(max(indices, key=actual))
+    return [iterations[index] for index in sorted(selected)]
+
+
+def render_html(model: dict[str, Any], title: str, chart_points: int = 2000) -> str:
+    chart_rows = sample_iterations(
+        model["iterations"], model["slowdown_alerts"], chart_points
+    )
     data = {
         "iterations": [
             {
@@ -605,7 +662,7 @@ def render_html(model: dict[str, Any], title: str) -> str:
                 "slow": bool(item.get("slow")),
                 "streak": item.get("consecutive_slow_iterations"),
             }
-            for item in model["iterations"]
+            for item in chart_rows
         ],
         "alertIterations": [
             item.get("iteration_id") for item in model["slowdown_alerts"]
@@ -667,7 +724,7 @@ footer{max-width:1240px;margin:0 auto;padding:10px 24px 30px;color:var(--muted);
 <main>
 <div class="metrics">__SUMMARY_CARDS__</div>
 <section><h2>自动结论</h2><ol class="insights">__INSIGHTS__</ol></section>
-<section><h2>迭代耗时趋势</h2><div class="chart-wrap"><svg id="iteration-chart" class="chart" viewBox="0 0 1120 390" role="img" aria-label="迭代耗时趋势图"></svg></div><div class="legend"><span><i></i>实际耗时</span><span><i class="slow"></i>慢迭代</span><span><i class="limit"></i>慢阈值</span></div></section>
+<section><h2>迭代耗时趋势</h2><p class="muted">__CHART_NOTE__</p><div class="chart-wrap"><svg id="iteration-chart" class="chart" viewBox="0 0 1120 390" role="img" aria-label="迭代耗时趋势图"></svg></div><div class="legend"><span><i></i>实际耗时</span><span><i class="slow"></i>慢迭代</span><span><i class="limit"></i>慢阈值</span></div></section>
 <section><h2>连续慢迭代区间</h2><div class="episodes">__EPISODES__</div></section>
 <section><h2>受影响 rank 聚合</h2>__RANK_ROWS__</section>
 <section><h2>Region 观测</h2>__REGION_ROWS__</section>
@@ -682,15 +739,16 @@ const DATA=__DATA__;
   const ns="http://www.w3.org/2000/svg", W=1120,H=390,m={l:66,r:24,t:22,b:45};
   const rows=DATA.iterations;
   if(!rows.length){svg.innerHTML='<text x="50%" y="50%" text-anchor="middle">没有迭代计时数据</text>';return;}
-  const ids=rows.map(x=>x.id), values=rows.flatMap(x=>[x.actual,x.threshold||0]);
-  const xmin=Math.min.apply(null,ids), xmax=Math.max.apply(null,ids), ymax=Math.max.apply(null,values)*1.08;
+  let xmin=Infinity,xmax=-Infinity,ymax=0;
+  for(const row of rows){xmin=Math.min(xmin,row.id);xmax=Math.max(xmax,row.id);ymax=Math.max(ymax,row.actual,row.threshold||0);}
+  ymax*=1.08;
   const x=v=>m.l+(v-xmin)/(Math.max(1,xmax-xmin))*(W-m.l-m.r);
   const y=v=>H-m.b-v/Math.max(1,ymax)*(H-m.t-m.b);
   const add=(name,attrs,text)=>{const el=document.createElementNS(ns,name);Object.entries(attrs||{}).forEach(([k,v])=>el.setAttribute(k,v));if(text!==undefined)el.textContent=text;svg.appendChild(el);return el;};
   for(let i=0;i<=5;i++){const value=ymax*i/5,yy=y(value);add("line",{x1:m.l,y1:yy,x2:W-m.r,y2:yy,class:"grid"});add("text",{x:m.l-8,y:yy+4,"text-anchor":"end"},value>=1000?(value/1000).toFixed(1)+"s":Math.round(value)+"ms");}
   add("line",{x1:m.l,y1:H-m.b,x2:W-m.r,y2:H-m.b,class:"axis"});
   add("line",{x1:m.l,y1:m.t,x2:m.l,y2:H-m.b,class:"axis"});
-  const ticks=Math.min(8,Math.max(2,ids.length-1));for(let i=0;i<=ticks;i++){const value=Math.round(xmin+(xmax-xmin)*i/ticks);add("text",{x:x(value),y:H-18,"text-anchor":"middle"},"iter "+value);}
+  const ticks=Math.min(8,Math.max(2,rows.length-1));for(let i=0;i<=ticks;i++){const value=Math.round(xmin+(xmax-xmin)*i/ticks);add("text",{x:x(value),y:H-18,"text-anchor":"middle"},"iter "+value);}
   const expected=rows.find(r=>r.expected)?.expected,limit=rows.find(r=>r.threshold)?.threshold;
   if(expected)add("line",{x1:m.l,y1:y(expected),x2:W-m.r,y2:y(expected),class:"expected"});
   if(limit)add("line",{x1:m.l,y1:y(limit),x2:W-m.r,y2:y(limit),class:"threshold"});
@@ -701,6 +759,7 @@ const DATA=__DATA__;
 </script>
 </body></html>"""
     replacements = {
+        "__CHART_NOTE__": f"趋势图显示 {len(chart_rows)} / {len(model['iterations'])} 条记录；统计基于全量数据。降采样保留首尾、分桶极值、全部慢点和告警位置。",
         "__TITLE__": esc(title),
         "__SOURCE__": esc(model["source"]),
         "__GENERATED__": esc(model["generated_at"]),
@@ -726,7 +785,7 @@ def default_output(log_path: Path) -> Path:
 
 def load_suppressed(
     explicit_path: Path | None, parsed: dict[str, Any]
-) -> tuple[list[dict[str, Any]], Path | None, int]:
+) -> tuple[int, Path | None, int]:
     candidate = explicit_path
     if candidate is None:
         configured = parsed.get("config", {}).get("suppressed_anomaly_log")
@@ -735,11 +794,11 @@ def load_suppressed(
             if configured_path.is_file():
                 candidate = configured_path
     if candidate is None:
-        return [], None, 0
+        return 0, None, 0
     if not candidate.is_file():
         raise FileNotFoundError(f"suppressed anomaly log does not exist: {candidate}")
-    records, malformed = parse_jsonl(candidate)
-    return records, candidate, malformed
+    count, malformed = count_jsonl(candidate)
+    return count, candidate, malformed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -757,6 +816,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--title", default="Straggler Analyzer Dashboard")
     parser.add_argument(
+        "--chart-points", type=int, default=2000,
+        help="ordinary trend point budget (default: 2000; 0 disables sampling); slow/alert points always retained",
+    )
+    parser.add_argument(
         "--summary-only",
         action="store_true",
         help="print the automatic conclusions without generating HTML",
@@ -769,6 +832,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.chart_points != 0 and args.chart_points < 4:
+        print("error: --chart-points must be zero or at least 4", file=sys.stderr)
+        return 2
     if not args.log.is_file():
         print(f"error: log does not exist: {args.log}", file=sys.stderr)
         return 2
@@ -791,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     output = args.output or default_output(args.log)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(render_html(model, args.title), encoding="utf-8")
+    output.write_text(render_html(model, args.title, args.chart_points), encoding="utf-8")
     print(f"dashboard: {output.resolve()}")
     if args.open:
         webbrowser.open(output.resolve().as_uri())
